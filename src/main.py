@@ -55,3 +55,17 @@ small_dataset = DatasetDict(
 )
 print(small_dataset)
 print(small_dataset['train'][:10])
+#%%
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+print(tokenizer)
+#%% Dataset preprocessing
+small_tokenized_dataset = small_dataset.map(
+    lambda example: tokenizer(example['text'], padding=True, truncation=True), # https://huggingface.co/docs/transformers/pad_truncation
+    batched=True,
+    batch_size=16
+)
+small_tokenized_dataset = small_tokenized_dataset.remove_columns(["text"])
+small_tokenized_dataset = small_tokenized_dataset.rename_column("label", "labels")
+small_tokenized_dataset.set_format("torch")
+print(small_tokenized_dataset['train'][0:2])
+#%%
