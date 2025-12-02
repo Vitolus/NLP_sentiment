@@ -1,154 +1,217 @@
 #%% import libraries
+import gc
 import os
-import time
+import re
+from collections import deque
+import cv2
+import lmdb
+import pickle
+import json
+import shutil
+from tqdm.notebook import tqdm
+import optuna
+from optuna.trial import TrialState
 import torch
+from torch import nn, optim
+from torch.utils.checkpoint import checkpoint
+from torch.utils.data import DataLoader, SubsetRandomSampler
+from torch.utils.tensorboard import SummaryWriter
+from torchvision import transforms
+import torchvision.models as models
+from torchinfo import summary
+from sklearn.model_selection import KFold, train_test_split
+from sklearn.metrics import f1_score
 import numpy as np
-from tqdm import tqdm
-from sklearn.metrics import f1_score, accuracy_score
+import matplotlib.pyplot as plt
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup
+from transformers import Trainer, TrainingArguments,TrainerCallback, EarlyStoppingCallback
 from datasets import load_dataset, DatasetDict
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-
-#%% Configuration
+#%%
 SEED = 42
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-# Using Phi-3-mini as a modern, efficient open-weight LLM
-MODEL_NAME = "microsoft/Phi-3-mini-4k-instruct" 
+MODEL_NAME = "microsoft/Phi-3-mini-4k-instruct"
 DATASET_NAME = "stanfordnlp/imdb"
-
 np.random.seed(SEED)
-torch.manual_seed(SEED)
-print(f"Using device: {DEVICE}")
-
-#%% Dataset loading (Mimicking main.py exactly)
+torch.manual_seed(SEED) # if using CPU
+torch.cuda.manual_seed(SEED) # if using single-GPU
+torch.cuda.manual_seed_all(SEED) # if using multi-GPU
+torch.backends.cudnn.deterministic = True # deterministic mode
+torch.backends.cudnn.benchmark = False # disable auto-tuner to find the best algorithm to use for your hardware
+torch.backends.cuda.matmul.allow_tf32 = True # allow TensorFloat-32 on matmul operations
+torch.backends.cudnn.allow_tf32  = True # allow TensorFloat-32 on convolution operations
+torch.autograd.set_detect_anomaly(True)
+print("Using device: ", DEVICE)
+#%% Dataset loading
 dataset = load_dataset(DATASET_NAME)
-
-# Just take the first 50 tokens for speed/consistency with main.py
+print(dataset)
+#%%
+# Just take the first 50 tokens for speed/running on cpu
 def truncate(example):
+    # Few-shot prompt design: providing examples to the LLM
+    review_segment = " ".join(example['text'].split()[:50])
+    prompt = (
+        "You are a sentiment classifier. Determine if the following movie reviews are POSITIVE or NEGATIVE.\n\n"
+        "Review: The movie was terrible, boring and too long.\n"
+        "Sentiment: NEGATIVE\n\n"
+        "Review: Absolutely fantastic! I loved every minute of it.\n"
+        "Sentiment: POSITIVE\n\n"
+        f"Review: {review_segment}\n"
+        "Sentiment:"
+    )
     return {
-        'text': " ".join(example['text'].split()[:50]),
+        'text': prompt,
         'label': example['label']
     }
 
-# Exact same split logic as main.py
 small_dataset = DatasetDict(
     train=dataset['train'].shuffle(seed=SEED).select(range(128)).map(truncate),
     val=dataset['train'].shuffle(seed=SEED).select(range(128, 160)).map(truncate),
 )
-
-print("Dataset loaded.")
+print(small_dataset)
+print(small_dataset['train'][:10])
 print(f"Train size: {len(small_dataset['train'])}")
 print(f"Val size: {len(small_dataset['val'])}")
-
-#%% Model Loading
-print(f"Loading model: {MODEL_NAME}...")
+#%%
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME, 
-    device_map="auto", 
-    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32, 
-    trust_remote_code=True
-)
+# Ensure pad token is set for Phi-3 (often missing in LLMs)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.unk_token if tokenizer.unk_token else tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
 
-# Create a generation pipeline
-pipe = pipeline(
-    "text-generation",
-    model=model,
+print(tokenizer)
+#%% Dataset preprocessing
+small_tokenized_dataset = small_dataset.map(
+    lambda example: tokenizer(example['text'], padding=True, truncation=True), # https://huggingface.co/docs/transformers/pad_truncation
+    batched=True,
+    batch_size=16
+)
+small_tokenized_dataset = small_tokenized_dataset.remove_columns(["text"])
+small_tokenized_dataset = small_tokenized_dataset.rename_column("label", "labels")
+small_tokenized_dataset.set_format("torch")
+print(small_tokenized_dataset['train'][0:2])
+#%%
+trainloader = DataLoader(small_tokenized_dataset['train'], batch_size=16, shuffle=True)
+valloader = DataLoader(small_tokenized_dataset['val'], batch_size=16, shuffle=False)
+#%% Model definition
+def model_init():
+    # Load Phi-3 for sequence classification
+    # We use trust_remote_code=True as required by Phi-3
+    model = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_NAME, 
+        num_labels=2, 
+        trust_remote_code=True,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+    )
+    model.config.pad_token_id = tokenizer.pad_token_id
+    
+    # Freeze the backbone to perform "Prompt-based Linear Probing"
+    # This keeps the LLM knowledge intact and only trains the classification head
+    # This is crucial to fit training on standard GPUs without LoRA
+    for param in model.base_model.parameters():
+        param.requires_grad = False
+        
+    return model
+
+model = model_init() # Create one instance for summary
+try:
+    # Adjusted input size for summary to match prompt length roughly
+    summary(model, input_size=(1, 128), col_names=('input_size', 'output_size', 'num_params', 'trainable'), dtypes=[torch.IntTensor])
+except Exception as e:
+    print(f"Summary skipped: {e}")
+#%%
+def compute_metrics(pred):
+    """Called at the end of validation. Gives accuracy"""
+    logits, labels = pred
+    predictions = np.argmax(logits, axis=-1)
+    return {
+        "accuracy": np.mean(predictions == labels),
+        "f1": f1_score(labels, predictions, average='weighted')
+    }
+
+def hp_space(trial):
+    return {
+        # Higher LR for head tuning
+        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 1e-3, log=True),
+        "weight_decay": trial.suggest_categorical("weight_decay", [0.0, 0.01]),
+        "num_train_epochs": trial.suggest_int("num_train_epochs", 1, 3),
+        # Smaller batch sizes for LLM memory constraints
+        "per_device_train_batch_size": trial.suggest_categorical("per_device_train_batch_size", [1, 2, 4]),
+    }
+
+arguments = TrainingArguments(
+    output_dir="./results",
+    per_device_train_batch_size=4, # Reduced for LLM
+    per_device_eval_batch_size=4,  # Reduced for LLM
+    gradient_accumulation_steps=4, # Accumulate gradients to simulate larger batch
+    num_train_epochs=1,
+    evaluation_strategy="epoch", # run validation at the end of each epoch
+    save_strategy="epoch",
+    learning_rate=2e-4,
+    load_best_model_at_end=True,
+    seed=SEED,
+    fp16=torch.cuda.is_available(), # Enable mixed precision for LLM
+)
+trainer = Trainer(
+    model_init=model_init,
+    args=arguments,
+    train_dataset=small_tokenized_dataset['train'],
+    eval_dataset=small_tokenized_dataset['val'], # change to test when you do your final evaluation!
     tokenizer=tokenizer,
-    max_new_tokens=10, # We only need a short answer (POSITIVE/NEGATIVE)
-    return_full_text=False,
-    pad_token_id=tokenizer.eos_token_id
+    compute_metrics=compute_metrics
 )
 
-#%% Prompt Engineering
-def create_zero_shot_prompt(target_text):
-    """
-    Creates a zero-shot prompt.
-    """
-    return f"Classify the sentiment of the following movie review as POSITIVE or NEGATIVE.\n\nReview: {target_text}\nSentiment:"
+class LoggingCallback(TrainerCallback):
+    def __init__(self, log_path):
+        self.log_path = log_path
+    # will call on_log on each logging step, specified by TrainerArguement. (i.e TrainerArguement.logginng_step)
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        _ = logs.pop("total_flos", None)
+        if state.is_local_process_zero:
+            with open(self.log_path, "a") as f:
+                f.write(json.dumps(logs) + "\n")
 
-def create_few_shot_prompt(target_text, examples):
-    """
-    Creates a few-shot prompt using examples from the training set.
-    """
-    prompt = "Classify the sentiment of the following movie reviews as POSITIVE or NEGATIVE.\n\n"
-    
-    # Add few-shot examples (3 examples)
-    for ex in examples:
-        label_str = "POSITIVE" if ex['label'] == 1 else "NEGATIVE"
-        prompt += f"Review: {ex['text']}\nSentiment: {label_str}\n\n"
-    
-    # Add target
-    prompt += f"Review: {target_text}\nSentiment:"
-    return prompt
+trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=1, early_stopping_threshold=0.0))
+trainer.add_callback(LoggingCallback("./results/log.jsonl"))
+#%%
+best_run = trainer.hyperparameter_search(
+    direction="maximize", 
+    backend="optuna", 
+    hp_space=hp_space, 
+    n_trials=5,
+    compute_objective=lambda metrics: metrics['eval_accuracy']
+)
+# Update trainer with best run hyperparameters and train final model
+for n, v in best_run.hyperparameters.items():
+    setattr(trainer.args, n, v)
+print(best_run)
+#%%
+trainer.train()
+#%%
+# just gets evaluation metrics
+# results = trainer.evaluate()
+# also gives you predictions
+results = trainer.predict(small_tokenized_dataset['val'])
+# Report metrics and inference time
+print("--- Evaluation Results ---")
+print(f"Accuracy: {results.metrics['test_accuracy']:.4f}")
+print(f"F1 Score: {results.metrics['test_f1']:.4f}")
+print(f"Inference Time: {results.metrics['test_runtime']:.4f} seconds")
+print(f"Inference Speed: {results.metrics['test_samples_per_second']:.2f} samples/sec")
+#%%
+# To load our saved model, we can pass the path to the checkpoint into the `from_pretrained` method:
+test_str = "I enjoyed the movie!"
+# Apply the same prompt template for inference
+prompt_test = (
+    "You are a sentiment classifier. Determine if the following movie reviews are POSITIVE or NEGATIVE.\n\n"
+    "Review: The movie was terrible, boring and too long.\n"
+    "Sentiment: NEGATIVE\n\n"
+    "Review: Absolutely fantastic! I loved every minute of it.\n"
+    "Sentiment: POSITIVE\n\n"
+    f"Review: {test_str}\n"
+    "Sentiment:"
+)
 
-# Select 3 fixed examples for few-shot to keep it deterministic
-few_shot_examples = [small_dataset['train'][i] for i in [0, 10, 20]]
-
-#%% Inference Loop
-def run_evaluation(strategy_name, prompt_func):
-    print(f"\nStarting inference for {strategy_name}...")
-    predictions = []
-    ground_truth = []
-    latencies = []
-
-    # Iterate over validation set
-    for i, example in tqdm(enumerate(small_dataset['val']), total=len(small_dataset['val'])):
-        text = example['text']
-        label = example['label']
-        ground_truth.append(label)
-        
-        # Construct prompt
-        prompt = prompt_func(text)
-        
-        # Measure inference time
-        start_time = time.time()
-        
-        # Generate
-        # Note: We use a low temperature for deterministic outputs
-        output = pipe(prompt, temperature=0.1, do_sample=False)
-        generated_text = output[0]['generated_text'].strip().upper()
-        
-        end_time = time.time()
-        latencies.append(end_time - start_time)
-        
-        # Parse prediction
-        if "POSITIVE" in generated_text:
-            pred_label = 1
-        elif "NEGATIVE" in generated_text:
-            pred_label = 0
-        else:
-            # Fallback or "Neutral"
-            pred_label = 0 
-            
-        predictions.append(pred_label)
-
-    accuracy = accuracy_score(ground_truth, predictions)
-    f1 = f1_score(ground_truth, predictions, average='weighted')
-    avg_latency = np.mean(latencies)
-    samples_per_sec = 1.0 / avg_latency
-
-    print(f"\n--- Evaluation Results ({strategy_name}) ---")
-    print(f"Model: {MODEL_NAME}")
-    print(f"Accuracy: {accuracy:.4f}")
-    print(f"F1 Score: {f1:.4f}")
-    print(f"Avg Inference Time: {avg_latency:.4f} seconds/sample")
-    print(f"Inference Speed: {samples_per_sec:.2f} samples/sec")
-    
-    return predictions, ground_truth
-
-# 1. Run Zero-Shot Evaluation
-preds_zero, truth_zero = run_evaluation("Zero-Shot", create_zero_shot_prompt)
-
-# 2. Run Few-Shot Evaluation
-preds_few, truth_few = run_evaluation("Few-Shot", lambda text: create_few_shot_prompt(text, few_shot_examples))
-
-#%% Qualitative Analysis (Optional)
-print("\n--- Qualitative Errors (Few-Shot) ---")
-count = 0
-for i, (true, pred) in enumerate(zip(truth_few, preds_few)):
-    if true != pred and count < 3:
-        print(f"Example {i}:")
-        print(f"Text: {small_dataset['val'][i]['text']}")
-        print(f"True: {'POSITIVE' if true==1 else 'NEGATIVE'}, Pred: {'POSITIVE' if pred==1 else 'NEGATIVE'}")
-        print("-" * 20)
-        count += 1
+finetuned_model = AutoModelForSequenceClassification.from_pretrained("./results/checkpoint-???")
+model_inputs = tokenizer(prompt_test, return_tensors="pt")
+prediction = torch.argmax(finetuned_model(**model_inputs).logits)
+print(["NEGATIVE", "POSITIVE"][prediction])
