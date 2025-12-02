@@ -6,6 +6,7 @@ from collections import deque
 import cv2
 import lmdb
 import pickle
+import json
 import shutil
 from tqdm.notebook import tqdm
 import optuna
@@ -73,7 +74,10 @@ print(small_tokenized_dataset['train'][0:2])
 trainloader = DataLoader(small_tokenized_dataset['train'], batch_size=16, shuffle=True)
 valloader = DataLoader(small_tokenized_dataset['val'], batch_size=16, shuffle=False)
 #%% Model definition
-model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=2)
+def model_init():
+    return AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=2)
+
+model = model_init() # Create one instance for summary
 summary(model, input_size=(16, 50), col_names=('input_size', 'output_size', 'num_params', 'trainable'))
 #%%
 def compute_metrics(pred):
@@ -82,6 +86,14 @@ def compute_metrics(pred):
     predictions = np.argmax(logits, axis=-1)
     # calculates the accuracy
     return {"accuracy": np.mean(predictions == labels)}
+
+def hp_space(trial):
+    return {
+        "learning_rate": trial.suggest_float("learning_rate", 2e-5, 5e-5, log=True),
+        "weight_decay": trial.suggest_categorical("weight_decay", [0.0, 0.01, 0.1]),
+        "num_train_epochs": trial.suggest_int("num_train_epochs", 1, 3),
+        "per_device_train_batch_size": trial.suggest_categorical("per_device_train_batch_size", [8, 16, 32]),
+    }
 
 arguments = TrainingArguments(
     output_dir="./results",
@@ -95,7 +107,7 @@ arguments = TrainingArguments(
     seed=SEED
 )
 trainer = Trainer(
-    model=model,
+    model_init=model_init,
     args=arguments,
     train_dataset=small_tokenized_dataset['train'],
     eval_dataset=small_tokenized_dataset['val'], # change to test when you do your final evaluation!
@@ -115,6 +127,17 @@ class LoggingCallback(TrainerCallback):
 
 trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=1, early_stopping_threshold=0.0))
 trainer.add_callback(LoggingCallback("./results/log.jsonl"))
+#%%
+best_run = trainer.hyperparameter_search(
+    direction="maximize", 
+    backend="optuna", 
+    hp_space=hp_space, 
+    n_trials=5
+)
+# Update trainer with best run hyperparameters and train final model
+for n, v in best_run.hyperparameters.items():
+    setattr(trainer.args, n, v)
+print(best_run)
 #%%
 trainer.train()
 #%%
