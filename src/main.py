@@ -85,7 +85,6 @@ def compute_metrics(pred):
     """Called at the end of validation. Gives accuracy"""
     logits, labels = pred
     predictions = np.argmax(logits, axis=-1)
-    # calculates the accuracy
     return {
         "accuracy": np.mean(predictions == labels),
         "f1": f1_score(labels, predictions, average='weighted')
@@ -150,6 +149,12 @@ trainer.train()
 # results = trainer.evaluate()
 # also gives you predictions
 results = trainer.predict(small_tokenized_dataset['val'])
+# Report metrics and inference time
+print("--- Evaluation Results ---")
+print(f"Accuracy: {results.metrics['test_accuracy']:.4f}")
+print(f"F1 Score: {results.metrics['test_f1']:.4f}")
+print(f"Inference Time: {results.metrics['test_runtime']:.4f} seconds")
+print(f"Inference Speed: {results.metrics['test_samples_per_second']:.2f} samples/sec")
 #%%
 # To load our saved model, we can pass the path to the checkpoint into the `from_pretrained` method:
 test_str = "I enjoyed the movie!"
