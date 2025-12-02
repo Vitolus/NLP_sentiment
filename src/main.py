@@ -20,10 +20,11 @@ from torchvision import transforms
 import torchvision.models as models
 from torchinfo import summary
 from sklearn.model_selection import KFold, train_test_split
+from sklearn.metrics import f1_score
 import numpy as np
 import matplotlib.pyplot as plt
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup, 
-Trainer, TrainingArguments,TrainerCallback, EarlyStoppingCallback
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup
+from transformers import Trainer, TrainingArguments,TrainerCallback, EarlyStoppingCallback
 from datasets import load_dataset, DatasetDict
 #%%
 SEED = 42
@@ -85,7 +86,10 @@ def compute_metrics(pred):
     logits, labels = pred
     predictions = np.argmax(logits, axis=-1)
     # calculates the accuracy
-    return {"accuracy": np.mean(predictions == labels)}
+    return {
+        "accuracy": np.mean(predictions == labels),
+        "f1": f1_score(labels, predictions, average='weighted')
+    }
 
 def hp_space(trial):
     return {
@@ -132,7 +136,8 @@ best_run = trainer.hyperparameter_search(
     direction="maximize", 
     backend="optuna", 
     hp_space=hp_space, 
-    n_trials=5
+    n_trials=5,
+    compute_objective=lambda metrics: metrics['eval_accuracy']
 )
 # Update trainer with best run hyperparameters and train final model
 for n, v in best_run.hyperparameters.items():
