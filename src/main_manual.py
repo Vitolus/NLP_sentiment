@@ -26,7 +26,7 @@ from datasets import load_dataset, DatasetDict
 #%%
 SEED = 42
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-MODEL_NAME = "distilbert/distilbert-base-uncased"
+MODEL_NAME = "distilbert-base-uncased"
 DATASET_NAME = "stanfordnlp/imdb"
 np.random.seed(SEED)
 torch.manual_seed(SEED) # if using CPU
