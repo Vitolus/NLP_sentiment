@@ -58,8 +58,10 @@ small_dataset = DatasetDict(
 )
 print(small_dataset)
 print(small_dataset['train'][:10])
+print(f"Train size: {len(small_dataset['train'])}")
+print(f"Val size: {len(small_dataset['val'])}")
 #%%
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 print(tokenizer)
 #%% Dataset preprocessing
 small_tokenized_dataset = small_dataset.map(
