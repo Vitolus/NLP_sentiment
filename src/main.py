@@ -21,7 +21,7 @@ from torchinfo import summary
 from sklearn.model_selection import KFold, train_test_split
 import numpy as np
 import matplotlib.pyplot as plt
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification, AdamW, get_linear_schedule_with_warmup
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup
 from datasets import load_dataset, DatasetDict
 #%%
 SEED = 42
@@ -78,7 +78,7 @@ summary(model, input_size=(16, 50), col_names=('input_size', 'output_size', 'num
 #%%
 num_epochs = 1
 train_steps = len(trainloader)
-optimizer = AdamW(model.parameters(), lr=5e-5)
+optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
 lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=train_steps)
 best_val_loss = float('inf')
 prog_bar = tqdm(range(train_steps))
