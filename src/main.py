@@ -76,3 +76,39 @@ model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_label
 model = model.eval().to(DEVICE, memory_format=torch.channels_last)
 summary(model, input_size=(16, 50), col_names=('input_size', 'output_size', 'num_params', 'trainable'))
 #%%
+num_epochs = 1
+train_steps = len(trainloader)
+optimizer = AdamW(model.parameters(), lr=5e-5)
+lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=train_steps)
+best_val_loss = float('inf')
+prog_bar = tqdm(range(train_steps))
+#%%
+for epoch in range(num_epochs):
+    model.train()
+    for batch in trainloader: # batch = ([text1, text2], [0, 1])
+        batch = {k: v.to(DEVICE, memory_format=torch.channels_last) for k, v in batch.items()}
+        out = model(**batch)
+        optimizer.zero_grad()
+        out.loss.backward()
+        optimizer.step()
+        lr_scheduler.step()
+        prog_bar.update(1)
+    model.eval()
+    for batch in valloader:
+        batch = {k: v.to(DEVICE, memory_format=torch.channels_last) for k, v in batch.items()}
+        with torch.no_grad():
+            out = model(**batch)
+        val_loss += out.loss
+    avg_val_loss = val_loss / len(valloader)
+    print(f"Epoch {epoch+1}/{num_epochs}, Validation Loss: {avg_val_loss:.4f}")
+    if avg_val_loss < best_val_loss:
+        print(f"Validation loss improved from {best_val_loss:.4f} to {avg_val_loss:.4f}. Saving model...")
+        best_val_loss = avg_val_loss
+        # torch.save({
+        #     'epoch': epoch,
+        #     'model_state_dict': model.state_dict(),
+        #     'optimizer_state_dict': optimizer.state_dict(),
+        #     'val_loss': best_val_loss,
+        #     },
+        #     f"checkpoints/epoch_{epoch}.pt"
+        # )
