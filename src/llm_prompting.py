@@ -44,9 +44,8 @@ print("Using device: ", DEVICE)
 #%% Dataset loading
 dataset = load_dataset(DATASET_NAME)
 print(dataset)
-#%%
-# Just take the first 50 tokens for speed/running on cpu
-def truncate(example):
+#%% Prompt Strategies
+def truncate_few_shot(example):
     # Few-shot prompt design: providing examples to the LLM
     review_segment = " ".join(example['text'].split()[:50])
     prompt = (
@@ -58,44 +57,27 @@ def truncate(example):
         f"Review: {review_segment}\n"
         "Sentiment:"
     )
-    return {
-        'text': prompt,
-        'label': example['label']
-    }
+    return {'text': prompt, 'label': example['label']}
 
-small_dataset = DatasetDict(
-    train=dataset['train'].shuffle(seed=SEED).select(range(128)).map(truncate),
-    val=dataset['train'].shuffle(seed=SEED).select(range(128, 160)).map(truncate),
-)
-print(small_dataset)
-print(small_dataset['train'][:10])
-print(f"Train size: {len(small_dataset['train'])}")
-print(f"Val size: {len(small_dataset['val'])}")
-#%%
+def truncate_zero_shot(example):
+    # Zero-shot prompt design: No examples, just instruction
+    review_segment = " ".join(example['text'].split()[:50])
+    prompt = (
+        "You are a sentiment classifier. Determine if the following movie reviews are POSITIVE or NEGATIVE.\n\n"
+        f"Review: {review_segment}\n"
+        "Sentiment:"
+    )
+    return {'text': prompt, 'label': example['label']}
+#%% Tokenizer
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 # Ensure pad token is set for Phi-3 (often missing in LLMs)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.unk_token if tokenizer.unk_token else tokenizer.eos_token
     tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
-
 print(tokenizer)
-#%% Dataset preprocessing
-small_tokenized_dataset = small_dataset.map(
-    lambda example: tokenizer(example['text'], padding=True, truncation=True), # https://huggingface.co/docs/transformers/pad_truncation
-    batched=True,
-    batch_size=16
-)
-small_tokenized_dataset = small_tokenized_dataset.remove_columns(["text"])
-small_tokenized_dataset = small_tokenized_dataset.rename_column("label", "labels")
-small_tokenized_dataset.set_format("torch")
-print(small_tokenized_dataset['train'][0:2])
-#%%
-trainloader = DataLoader(small_tokenized_dataset['train'], batch_size=16, shuffle=True)
-valloader = DataLoader(small_tokenized_dataset['val'], batch_size=16, shuffle=False)
-#%% Model definition
+#%% Model Definition
 def model_init():
     # Load Phi-3 for sequence classification
-    # We use trust_remote_code=True as required by Phi-3
     model = AutoModelForSequenceClassification.from_pretrained(
         MODEL_NAME, 
         num_labels=2, 
@@ -103,13 +85,11 @@ def model_init():
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
     )
     model.config.pad_token_id = tokenizer.pad_token_id
-    
-    # Freeze the backbone to perform "Prompt-based Linear Probing"
+    # Freeze the backbone to perform Linear Probing
     # This keeps the LLM knowledge intact and only trains the classification head
     # This is crucial to fit training on standard GPUs without LoRA
     for param in model.base_model.parameters():
         param.requires_grad = False
-        
     return model
 
 model = model_init() # Create one instance for summary
@@ -138,28 +118,6 @@ def hp_space(trial):
         "per_device_train_batch_size": trial.suggest_categorical("per_device_train_batch_size", [1, 2, 4]),
     }
 
-arguments = TrainingArguments(
-    output_dir="./results",
-    per_device_train_batch_size=4, # Reduced for LLM
-    per_device_eval_batch_size=4,  # Reduced for LLM
-    gradient_accumulation_steps=4, # Accumulate gradients to simulate larger batch
-    num_train_epochs=1,
-    evaluation_strategy="epoch", # run validation at the end of each epoch
-    save_strategy="epoch",
-    learning_rate=2e-4,
-    load_best_model_at_end=True,
-    seed=SEED,
-    fp16=torch.cuda.is_available(), # Enable mixed precision for LLM
-)
-trainer = Trainer(
-    model_init=model_init,
-    args=arguments,
-    train_dataset=small_tokenized_dataset['train'],
-    eval_dataset=small_tokenized_dataset['val'], # change to test when you do your final evaluation!
-    tokenizer=tokenizer,
-    compute_metrics=compute_metrics
-)
-
 class LoggingCallback(TrainerCallback):
     def __init__(self, log_path):
         self.log_path = log_path
@@ -167,51 +125,81 @@ class LoggingCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         _ = logs.pop("total_flos", None)
         if state.is_local_process_zero:
+            os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
             with open(self.log_path, "a") as f:
                 f.write(json.dumps(logs) + "\n")
+#%% Experiment Runner
+def run_experiment(name, map_fn):
+    print(f"\n\n{'='*20} Running Experiment: {name} {'='*20}")
+    # Prepare Data
+    current_dataset = DatasetDict(
+        train=dataset['train'].shuffle(seed=SEED).select(range(128)).map(map_fn),
+        val=dataset['train'].shuffle(seed=SEED).select(range(128, 160)).map(map_fn),
+    )
+    tokenized_dataset = current_dataset.map(
+        lambda example: tokenizer(example['text'], padding=True, truncation=True),
+        batched=True,
+        batch_size=16
+    )
+    tokenized_dataset = tokenized_dataset.remove_columns(["text"])
+    tokenized_dataset = tokenized_dataset.rename_column("label", "labels")
+    tokenized_dataset.set_format("torch")
+    # Setup Trainer
+    arguments = TrainingArguments(
+        output_dir=f"./results/{name}",
+        per_device_train_batch_size=4,
+        per_device_eval_batch_size=4,
+        gradient_accumulation_steps=4,
+        num_train_epochs=1,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        learning_rate=2e-4,
+        load_best_model_at_end=True,
+        seed=SEED,
+        fp16=torch.cuda.is_available(),
+        logging_dir=f"./results/{name}/logs"
+    )
+    trainer = Trainer(
+        model_init=model_init,
+        args=arguments,
+        train_dataset=tokenized_dataset['train'],
+        eval_dataset=tokenized_dataset['val'],
+        tokenizer=tokenizer,
+        compute_metrics=compute_metrics
+    )
+    trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=1, early_stopping_threshold=0.0))
+    trainer.add_callback(LoggingCallback(f"./results/{name}/log.jsonl"))
+    # Hyperparameter Search
+    print(f"--- Tuning Hyperparameters for {name} ---")
+    best_run = trainer.hyperparameter_search(
+        direction="maximize", 
+        backend="optuna", 
+        hp_space=hp_space, 
+        n_trials=5,
+        compute_objective=lambda metrics: metrics['eval_accuracy']
+    )
+    # Train Best Model
+    print(f"--- Training Best Model for {name} ---")
+    for n, v in best_run.hyperparameters.items():
+        setattr(trainer.args, n, v)
+    trainer.train()
+    # Evaluate
+    results = trainer.predict(tokenized_dataset['val'])
+    # Cleanup to free VRAM for next run
+    del trainer
+    gc.collect()
+    torch.cuda.empty_cache()
+    return results.metrics
 
-trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=1, early_stopping_threshold=0.0))
-trainer.add_callback(LoggingCallback("./results/log.jsonl"))
-#%%
-best_run = trainer.hyperparameter_search(
-    direction="maximize", 
-    backend="optuna", 
-    hp_space=hp_space, 
-    n_trials=5,
-    compute_objective=lambda metrics: metrics['eval_accuracy']
-)
-# Update trainer with best run hyperparameters and train final model
-for n, v in best_run.hyperparameters.items():
-    setattr(trainer.args, n, v)
-print(best_run)
-#%%
-trainer.train()
-#%%
-# just gets evaluation metrics
-# results = trainer.evaluate()
-# also gives you predictions
-results = trainer.predict(small_tokenized_dataset['val'])
-# Report metrics and inference time
-print("--- Evaluation Results ---")
-print(f"Accuracy: {results.metrics['test_accuracy']:.4f}")
-print(f"F1 Score: {results.metrics['test_f1']:.4f}")
-print(f"Inference Time: {results.metrics['test_runtime']:.4f} seconds")
-print(f"Inference Speed: {results.metrics['test_samples_per_second']:.2f} samples/sec")
-#%%
-# To load our saved model, we can pass the path to the checkpoint into the `from_pretrained` method:
-test_str = "I enjoyed the movie!"
-# Apply the same prompt template for inference
-prompt_test = (
-    "You are a sentiment classifier. Determine if the following movie reviews are POSITIVE or NEGATIVE.\n\n"
-    "Review: The movie was terrible, boring and too long.\n"
-    "Sentiment: NEGATIVE\n\n"
-    "Review: Absolutely fantastic! I loved every minute of it.\n"
-    "Sentiment: POSITIVE\n\n"
-    f"Review: {test_str}\n"
-    "Sentiment:"
-)
-
-finetuned_model = AutoModelForSequenceClassification.from_pretrained("./results/checkpoint-???")
-model_inputs = tokenizer(prompt_test, return_tensors="pt")
-prediction = torch.argmax(finetuned_model(**model_inputs).logits)
-print(["NEGATIVE", "POSITIVE"][prediction])
+#%% Execution
+# Run Few-Shot Training
+fs_metrics = run_experiment("Few_Shot", truncate_few_shot)
+# Run Zero-Shot Training
+zs_metrics = run_experiment("Zero_Shot", truncate_zero_shot)
+#%% Comparison
+print("\n\n=== FINAL COMPARISON ===")
+print(f"{'Metric':<20} | {'Few-Shot':<15} | {'Zero-Shot':<15}")
+print("-" * 56)
+print(f"{'Accuracy':<20} | {fs_metrics['test_accuracy']:.4f}          | {zs_metrics['test_accuracy']:.4f}")
+print(f"{'F1 Score':<20} | {fs_metrics['test_f1']:.4f}          | {zs_metrics['test_f1']:.4f}")
+print(f"{'Inference Time (s)':<20} | {fs_metrics['test_runtime']:.4f}          | {zs_metrics['test_runtime']:.4f}")
