@@ -21,7 +21,7 @@ from torchinfo import summary
 from sklearn.model_selection import KFold, train_test_split
 import numpy as np
 import matplotlib.pyplot as plt
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification, AdamW, get_linear_schedule_with_warmup
 from datasets import load_dataset, DatasetDict
 #%%
 SEED = 42
@@ -50,8 +50,8 @@ def truncate(example):
     }
 
 small_dataset = DatasetDict(
-    train=dataset['train'].shuffle(seed=1111).select(range(128)).map(truncate),
-    val=dataset['train'].shuffle(seed=1111).select(range(128, 160)).map(truncate),
+    train=dataset['train'].shuffle(seed=SEED).select(range(128)).map(truncate),
+    val=dataset['train'].shuffle(seed=SEED).select(range(128, 160)).map(truncate),
 )
 print(small_dataset)
 print(small_dataset['train'][:10])
@@ -68,4 +68,11 @@ small_tokenized_dataset = small_tokenized_dataset.remove_columns(["text"])
 small_tokenized_dataset = small_tokenized_dataset.rename_column("label", "labels")
 small_tokenized_dataset.set_format("torch")
 print(small_tokenized_dataset['train'][0:2])
+#%%
+trainloader = DataLoader(small_tokenized_dataset['train'], batch_size=16, shuffle=True)
+valloader = DataLoader(small_tokenized_dataset['val'], batch_size=16, shuffle=False)
+#%% Model definition
+model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=2)
+model = model.eval().to(DEVICE, memory_format=torch.channels_last)
+summary(model, input_size=(16, 50), col_names=('input_size', 'output_size', 'num_params', 'trainable'))
 #%%
