@@ -9,7 +9,7 @@ from torchinfo import summary
 from sklearn.metrics import f1_score
 import numpy as np
 import matplotlib.pyplot as plt
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from transformers import Trainer, TrainingArguments,TrainerCallback, EarlyStoppingCallback
 from datasets import load_dataset, DatasetDict
 #%%

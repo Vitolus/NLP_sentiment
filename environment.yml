@@ -4,15 +4,23 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.14
+  - python=3.12
+  - pip
+  - mamba
   - numpy
   - matplotlib
+  - transformers=4.37
+  - datasets
   - scikit-learn
   - notebook
-  - transformers
-  - datasets
+  - ipykernel
+  - ipywidgets
+  - widgetsnbextension
+  - jupyterlab
+  - jupyterlab_widgets
   - tqdm
   - torchinfo
+  - optuna
   - pip:
       - torch --index-url https://download.pytorch.org/whl/cu130
       - torchvision --index-url https://download.pytorch.org/whl/cu130
