@@ -1,25 +1,11 @@
 #%% import libraries
 import gc
 import os
-import re
-from collections import deque
-import cv2
-import lmdb
-import pickle
 import json
-import shutil
 from tqdm.notebook import tqdm
-import optuna
-from optuna.trial import TrialState
 import torch
-from torch import nn, optim
-from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, SubsetRandomSampler
-from torch.utils.tensorboard import SummaryWriter
-from torchvision import transforms
-import torchvision.models as models
 from torchinfo import summary
-from sklearn.model_selection import KFold, train_test_split
 from sklearn.metrics import f1_score
 import numpy as np
 import matplotlib.pyplot as plt
