@@ -4,13 +4,13 @@ import os
 import json
 from tqdm.notebook import tqdm
 import torch
-from torch.utils.data import DataLoader, SubsetRandomSampler
-from torchinfo import summary
+from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score
 import numpy as np
 import matplotlib.pyplot as plt
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from transformers import Trainer, TrainingArguments,TrainerCallback, EarlyStoppingCallback
+from transformers import DataCollatorWithPadding
 from datasets import load_dataset, DatasetDict
 #%%
 SEED = 42
@@ -66,9 +66,6 @@ valloader = DataLoader(small_tokenized_dataset['val'], batch_size=16, shuffle=Fa
 def model_init():
     return AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=2)
 
-model = model_init() # Create one instance for summary
-summary(model, input_size=(16, 50), col_names=('input_size', 'output_size', 'num_params', 'trainable'))
-#%%
 def compute_metrics(pred):
     """Called at the end of validation. Gives accuracy"""
     logits, labels = pred
@@ -91,18 +88,19 @@ arguments = TrainingArguments(
     per_device_train_batch_size=16,
     per_device_eval_batch_size=16,
     num_train_epochs=1,
-    evaluation_strategy="epoch", # run validation at the end of each epoch
+    eval_strategy="epoch", # run validation at the end of each epoch
     save_strategy="epoch",
     learning_rate=2e-5,
     load_best_model_at_end=True,
     seed=SEED
 )
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 trainer = Trainer(
     model_init=model_init,
     args=arguments,
     train_dataset=small_tokenized_dataset['train'],
     eval_dataset=small_tokenized_dataset['val'], # change to test when you do your final evaluation!
-    tokenizer=tokenizer,
+    data_collator=data_collator,
     compute_metrics=compute_metrics
 )
 
@@ -144,6 +142,8 @@ print(f"F1 Score: {results.metrics['test_f1']:.4f}")
 print(f"Inference Time: {results.metrics['test_runtime']:.4f} seconds")
 print(f"Inference Speed: {results.metrics['test_samples_per_second']:.2f} samples/sec")
 #%%
+#TODO: missing the saving of the checkpoint
+
 # To load our saved model, we can pass the path to the checkpoint into the `from_pretrained` method:
 test_str = "I enjoyed the movie!"
 finetuned_model = AutoModelForSequenceClassification.from_pretrained("./results/checkpoint-???")
