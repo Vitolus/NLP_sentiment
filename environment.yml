@@ -9,7 +9,12 @@ dependencies:
   - mamba
   - numpy
   - matplotlib
-  - transformers=4.37
+  - pytorch
+  - torchvision
+  - torchaudio
+  - transformers
+  - accelerate
+  - evaluate
   - datasets
   - scikit-learn
   - notebook
@@ -21,6 +26,3 @@ dependencies:
   - tqdm
   - torchinfo
   - optuna
-  - pip:
-      - torch --index-url https://download.pytorch.org/whl/cu130
-      - torchvision --index-url https://download.pytorch.org/whl/cu130
