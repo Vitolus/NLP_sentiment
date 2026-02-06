@@ -4,13 +4,13 @@ import os
 import json
 from tqdm.notebook import tqdm
 import torch
-from torch.utils.data import DataLoader, SubsetRandomSampler
-from torchinfo import summary
+from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score
 import numpy as np
 import matplotlib.pyplot as plt
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
 from transformers import Trainer, TrainingArguments,TrainerCallback, EarlyStoppingCallback
+from transformers import DataCollatorWithPadding
 from datasets import load_dataset, DatasetDict
 #%%
 SEED = 42
@@ -25,7 +25,7 @@ torch.backends.cudnn.deterministic = True # deterministic mode
 torch.backends.cudnn.benchmark = False # disable auto-tuner to find the best algorithm to use for your hardware
 torch.backends.cuda.matmul.allow_tf32 = True # allow TensorFloat-32 on matmul operations
 torch.backends.cudnn.allow_tf32  = True # allow TensorFloat-32 on convolution operations
-torch.autograd.set_detect_anomaly(True)
+# torch.autograd.set_detect_anomaly(True) # keep this commented out for speed unless debugging NaN
 print("Using device: ", DEVICE)
 #%% Dataset loading
 dataset = load_dataset(DATASET_NAME)
@@ -33,6 +33,7 @@ print(dataset)
 #%% Prompt Strategies
 def truncate_few_shot(example):
     # Few-shot prompt design: providing examples to the LLM
+    # Take the first 50 words of the review to keep the prompt short
     review_segment = " ".join(example['text'].split()[:50])
     prompt = (
         "You are a sentiment classifier. Determine if the following movie reviews are POSITIVE or NEGATIVE.\n\n"
@@ -45,6 +46,15 @@ def truncate_few_shot(example):
     )
     return {'text': prompt, 'label': example['label']}
 
+small_few_shot = DatasetDict(
+    train=dataset['train'].shuffle(seed=SEED).select(range(128)).map(truncate_few_shot),
+    val=dataset['train'].shuffle(seed=SEED).select(range(128, 160)).map(truncate_few_shot),
+)
+print(small_few_shot)
+print(small_few_shot['train'][:10])
+print(f"Train size: {len(small_few_shot['train'])}")
+print(f"Val size: {len(small_few_shot['val'])}")
+#%%
 def truncate_zero_shot(example):
     # Zero-shot prompt design: No examples, just instruction
     review_segment = " ".join(example['text'].split()[:50])
@@ -54,40 +64,58 @@ def truncate_zero_shot(example):
         "Sentiment:"
     )
     return {'text': prompt, 'label': example['label']}
+
+small_zero_shot = DatasetDict(
+    train=dataset['train'].shuffle(seed=SEED).select(range(128)).map(truncate_zero_shot),
+    val=dataset['train'].shuffle(seed=SEED).select(range(128, 160)).map(truncate_zero_shot),
+)
+print(small_zero_shot)
+print(small_zero_shot['train'][:10])
+print(f"Train size: {len(small_zero_shot['train'])}")
+print(f"Val size: {len(small_zero_shot['val'])}")
 #%% Tokenizer
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-# Ensure pad token is set for Phi-3 (often missing in LLMs)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.unk_token if tokenizer.unk_token else tokenizer.eos_token
-    tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=False)
 print(tokenizer)
+#%% Dataset preprocessing
+small_tokenized_few_shot = small_few_shot.map(
+    lambda example: tokenizer(example['text'], truncation=True),
+    batched=True,
+    batch_size=16
+)
+small_tokenized_few_shot = small_tokenized_few_shot.remove_columns(["text"])
+small_tokenized_few_shot = small_tokenized_few_shot.rename_column("label", "labels")
+small_tokenized_few_shot.set_format("torch")
+print(small_tokenized_few_shot['train'][0:2])
+#%% Dataset preprocessing
+small_tokenized_zero_shot = small_zero_shot.map(
+    lambda example: tokenizer(example['text'], truncation=True),
+    batched=True,
+    batch_size=16
+)
+small_tokenized_zero_shot = small_tokenized_zero_shot.remove_columns(["text"])
+small_tokenized_zero_shot = small_tokenized_zero_shot.rename_column("label", "labels")
+small_tokenized_zero_shot.set_format("torch")
+print(small_tokenized_zero_shot['train'][0:2])
 #%% Model Definition
 def model_init():
-    # Load Phi-3 for sequence classification
-    model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME, 
-        num_labels=2, 
-        trust_remote_code=True,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-    )
-    model.config.pad_token_id = tokenizer.pad_token_id
-    # Freeze the backbone to perform Linear Probing
-    # This keeps the LLM knowledge intact and only trains the classification head
-    # This is crucial to fit training on standard GPUs without LoRA
-    for param in model.base_model.parameters():
-        param.requires_grad = False
-    return model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    config = AutoConfig.from_pretrained(MODEL_NAME, trust_remote_code=False)
+    # IMPORTANT: Do not set rope_scaling to None on Phi-3 configs with transformers>=5.
+    # Doing so will set rope_parameters=None internally and crash the native Phi3 implementation.
+    # Leave the default as-is; if needed, adjust rope_type explicitly (e.g., to 'linear').
+    # Example of safe adjustment (commented out):
+    # if isinstance(config.rope_scaling, dict) and config.rope_scaling.get("rope_type") == "default":
+    #     config.rope_scaling["rope_type"] = "linear"
+    
+    return AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, config=config, num_labels=2, trust_remote_code=False)
 
-model = model_init() # Create one instance for summary
-try:
-    # Adjusted input size for summary to match prompt length roughly
-    summary(model, input_size=(1, 128), col_names=('input_size', 'output_size', 'num_params', 'trainable'), dtypes=[torch.IntTensor])
-except Exception as e:
-    print(f"Summary skipped: {e}")
-#%%
 def compute_metrics(pred):
     """Called at the end of validation. Gives accuracy"""
-    logits, labels = pred
+    logits = pred.predictions
+    labels = pred.label_ids
     predictions = np.argmax(logits, axis=-1)
     return {
         "accuracy": np.mean(predictions == labels),
@@ -96,13 +124,58 @@ def compute_metrics(pred):
 
 def hp_space(trial):
     return {
-        # Higher LR for head tuning
-        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 1e-3, log=True),
-        "weight_decay": trial.suggest_categorical("weight_decay", [0.0, 0.01]),
+        "learning_rate": trial.suggest_float("learning_rate", 2e-5, 5e-5, log=True),
+        "weight_decay": trial.suggest_categorical("weight_decay", [0.0, 0.01, 0.1]),
         "num_train_epochs": trial.suggest_int("num_train_epochs", 1, 3),
-        # Smaller batch sizes for LLM memory constraints
-        "per_device_train_batch_size": trial.suggest_categorical("per_device_train_batch_size", [1, 2, 4]),
+        "per_device_train_batch_size": trial.suggest_categorical("per_device_train_batch_size", [4, 8, 16]),
+        "gradient_accumulation_steps": trial.suggest_categorical("gradient_accumulation_steps", [1, 2, 4]),
     }
+
+arguments_few_shot = TrainingArguments(
+    output_dir="./results/few_shot",
+    per_device_train_batch_size=8,
+    per_device_eval_batch_size=16,
+    gradient_accumulation_steps=2,
+    num_train_epochs=1,
+    eval_strategy="epoch", # run validation at the end of each epoch
+    save_strategy="epoch",
+    learning_rate=2e-5,
+    load_best_model_at_end=True,
+    seed=SEED,
+    fp16=torch.cuda.is_available(),
+    dataloader_pin_memory=torch.cuda.is_available()
+)
+arguments_zero_shot = TrainingArguments(
+    output_dir="./results/zero_shot",
+    per_device_train_batch_size=8,
+    per_device_eval_batch_size=16,
+    gradient_accumulation_steps=2,
+    num_train_epochs=1,
+    eval_strategy="epoch", # run validation at the end of each epoch
+    save_strategy="epoch",
+    learning_rate=2e-5,
+    load_best_model_at_end=True,
+    seed=SEED,
+    fp16=torch.cuda.is_available(),
+    dataloader_pin_memory=torch.cuda.is_available()
+)
+
+trainer_few_shot = Trainer(
+    model_init=model_init,
+    args=arguments_few_shot,
+    train_dataset=small_tokenized_few_shot['train'],
+    eval_dataset=small_tokenized_few_shot['val'], # change to test when you do your final evaluation!
+    data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+    compute_metrics=compute_metrics
+)
+trainer_zero_shot = Trainer(
+    model_init=model_init,
+    args=arguments_zero_shot,
+    train_dataset=small_tokenized_zero_shot['train'],
+    eval_dataset=small_tokenized_zero_shot['val'], # change to test when you do your final evaluation!
+    data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+    compute_metrics=compute_metrics
+)
 
 class LoggingCallback(TrainerCallback):
     def __init__(self, log_path):
@@ -114,78 +187,64 @@ class LoggingCallback(TrainerCallback):
             os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
             with open(self.log_path, "a") as f:
                 f.write(json.dumps(logs) + "\n")
-#%% Experiment Runner
-def run_experiment(name, map_fn):
-    print(f"\n\n{'='*20} Running Experiment: {name} {'='*20}")
-    # Prepare Data
-    current_dataset = DatasetDict(
-        train=dataset['train'].shuffle(seed=SEED).select(range(128)).map(map_fn),
-        val=dataset['train'].shuffle(seed=SEED).select(range(128, 160)).map(map_fn),
-    )
-    tokenized_dataset = current_dataset.map(
-        lambda example: tokenizer(example['text'], padding=True, truncation=True),
-        batched=True,
-        batch_size=16
-    )
-    tokenized_dataset = tokenized_dataset.remove_columns(["text"])
-    tokenized_dataset = tokenized_dataset.rename_column("label", "labels")
-    tokenized_dataset.set_format("torch")
-    # Setup Trainer
-    arguments = TrainingArguments(
-        output_dir=f"./results/{name}",
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=4,
-        gradient_accumulation_steps=4,
-        num_train_epochs=1,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        learning_rate=2e-4,
-        load_best_model_at_end=True,
-        seed=SEED,
-        fp16=torch.cuda.is_available(),
-        logging_dir=f"./results/{name}/logs"
-    )
-    trainer = Trainer(
-        model_init=model_init,
-        args=arguments,
-        train_dataset=tokenized_dataset['train'],
-        eval_dataset=tokenized_dataset['val'],
-        tokenizer=tokenizer,
-        compute_metrics=compute_metrics
-    )
-    trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=1, early_stopping_threshold=0.0))
-    trainer.add_callback(LoggingCallback(f"./results/{name}/log.jsonl"))
-    # Hyperparameter Search
-    print(f"--- Tuning Hyperparameters for {name} ---")
-    best_run = trainer.hyperparameter_search(
-        direction="maximize", 
-        backend="optuna", 
-        hp_space=hp_space, 
-        n_trials=5,
-        compute_objective=lambda metrics: metrics['eval_accuracy']
-    )
-    # Train Best Model
-    print(f"--- Training Best Model for {name} ---")
-    for n, v in best_run.hyperparameters.items():
-        setattr(trainer.args, n, v)
-    trainer.train()
-    # Evaluate
-    results = trainer.predict(tokenized_dataset['val'])
-    # Cleanup to free VRAM for next run
-    del trainer
-    gc.collect()
-    torch.cuda.empty_cache()
-    return results.metrics
 
+class FreeMemoryCallback(TrainerCallback):
+    """
+    Frees Python + CUDA memory at the end of *each* training run.
+    This matters a lot during hyperparameter_search, which runs multiple train() calls.
+    """
+    def on_train_end(self, args, state, control, **kwargs):
+        # Try to release as much as possible between Optuna trials
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+trainer_few_shot.add_callback(EarlyStoppingCallback(early_stopping_patience=1, early_stopping_threshold=0.0))
+trainer_few_shot.add_callback(LoggingCallback("./results/log_few_shot.jsonl"))
+trainer_few_shot.add_callback(FreeMemoryCallback())
+trainer_zero_shot.add_callback(EarlyStoppingCallback(early_stopping_patience=1, early_stopping_threshold=0.0))
+trainer_zero_shot.add_callback(LoggingCallback("./results/log_zero_shot.jsonl"))
+trainer_zero_shot.add_callback(FreeMemoryCallback())
+#%% Few Shot Experiment
+best_run_few_shot = trainer_few_shot.hyperparameter_search(
+    direction="maximize",
+    backend="optuna",
+    hp_space=hp_space,
+    n_trials=5,
+    compute_objective=lambda metrics: metrics['eval_accuracy'],
+    gc_after_trial=True
+)
+# Update trainer with best run hyperparameters and train final model
+for n, v in best_run_few_shot.hyperparameters.items():
+    setattr(trainer_few_shot.args, n, v)
+print(best_run_few_shot)
+#%% Zero Shot Experiment
+best_run_zero_shot = trainer_zero_shot.hyperparameter_search(
+    direction="maximize",
+    backend="optuna",
+    hp_space=hp_space,
+    n_trials=5,
+    compute_objective=lambda metrics: metrics['eval_accuracy'],
+    gc_after_trial=True
+)
+# Update trainer with best run hyperparameters and train final model
+for n, v in best_run_zero_shot.hyperparameters.items():
+    setattr(trainer_zero_shot.args, n, v)
+print(best_run_zero_shot)
 #%% Execution
-# Run Few-Shot Training
-fs_metrics = run_experiment("Few_Shot", truncate_few_shot)
-# Run Zero-Shot Training
-zs_metrics = run_experiment("Zero_Shot", truncate_zero_shot)
+trainer_few_shot.train()
+#%%
+results_few_shot = trainer_few_shot.predict(small_tokenized_few_shot['val'])
+#%%
+trainer_zero_shot.train()
+#%%
+results_zero_shot = trainer_zero_shot.predict(small_tokenized_zero_shot['val'])
 #%% Comparison
-print("\n\n=== FINAL COMPARISON ===")
+print("--- FINAL COMPARISON ---")
 print(f"{'Metric':<20} | {'Few-Shot':<15} | {'Zero-Shot':<15}")
 print("-" * 56)
-print(f"{'Accuracy':<20} | {fs_metrics['test_accuracy']:.4f}          | {zs_metrics['test_accuracy']:.4f}")
-print(f"{'F1 Score':<20} | {fs_metrics['test_f1']:.4f}          | {zs_metrics['test_f1']:.4f}")
-print(f"{'Inference Time (s)':<20} | {fs_metrics['test_runtime']:.4f}          | {zs_metrics['test_runtime']:.4f}")
+print(f"{'Accuracy':<20} | {results_few_shot.metrics['test_accuracy']:.4f}  | {results_zero_shot.metrics['test_accuracy']:.4f}")
+print(f"{'F1 Score':<20} | {results_few_shot.metrics['test_f1']:.4f}  | {results_zero_shot.metrics['test_f1']:.4f}")
+print(f"{'Inference Time (s)':<20} | {results_few_shot.metrics['test_runtime']:.4f}  | {results_zero_shot.metrics['test_runtime']:.4f}")
+print(f"{'Inference Speed (samples/s)':<20} | {results_few_shot.metrics['test_samples_per_second']:.4f}  | {results_zero_shot.metrics['test_samples_per_second']:.4f}")

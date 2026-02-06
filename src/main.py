@@ -25,7 +25,7 @@ torch.backends.cudnn.deterministic = True # deterministic mode
 torch.backends.cudnn.benchmark = False # disable auto-tuner to find the best algorithm to use for your hardware
 torch.backends.cuda.matmul.allow_tf32 = True # allow TensorFloat-32 on matmul operations
 torch.backends.cudnn.allow_tf32  = True # allow TensorFloat-32 on convolution operations
-torch.autograd.set_detect_anomaly(True)
+# torch.autograd.set_detect_anomaly(True) # keep this commented out for speed unless debugging NaN
 print("Using device: ", DEVICE)
 #%% Dataset loading
 dataset = load_dataset(DATASET_NAME)
@@ -46,12 +46,12 @@ print(small_dataset)
 print(small_dataset['train'][:10])
 print(f"Train size: {len(small_dataset['train'])}")
 print(f"Val size: {len(small_dataset['val'])}")
-#%%
+#%% Tokenizer
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 print(tokenizer)
 #%% Dataset preprocessing
 small_tokenized_dataset = small_dataset.map(
-    lambda example: tokenizer(example['text'], padding=True, truncation=True), # https://huggingface.co/docs/transformers/pad_truncation
+    lambda example: tokenizer(example['text'], truncation=True),
     batched=True,
     batch_size=16
 )
@@ -59,16 +59,14 @@ small_tokenized_dataset = small_tokenized_dataset.remove_columns(["text"])
 small_tokenized_dataset = small_tokenized_dataset.rename_column("label", "labels")
 small_tokenized_dataset.set_format("torch")
 print(small_tokenized_dataset['train'][0:2])
-#%%
-trainloader = DataLoader(small_tokenized_dataset['train'], batch_size=16, shuffle=True)
-valloader = DataLoader(small_tokenized_dataset['val'], batch_size=16, shuffle=False)
 #%% Model definition
 def model_init():
     return AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=2)
 
 def compute_metrics(pred):
     """Called at the end of validation. Gives accuracy"""
-    logits, labels = pred
+    logits = pred.predictions
+    labels = pred.label_ids
     predictions = np.argmax(logits, axis=-1)
     return {
         "accuracy": np.mean(predictions == labels),
@@ -94,13 +92,12 @@ arguments = TrainingArguments(
     load_best_model_at_end=True,
     seed=SEED
 )
-data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 trainer = Trainer(
     model_init=model_init,
     args=arguments,
     train_dataset=small_tokenized_dataset['train'],
     eval_dataset=small_tokenized_dataset['val'], # change to test when you do your final evaluation!
-    data_collator=data_collator,
+    data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
     compute_metrics=compute_metrics
 )
 
@@ -115,7 +112,7 @@ class LoggingCallback(TrainerCallback):
                 f.write(json.dumps(logs) + "\n")
 
 trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=1, early_stopping_threshold=0.0))
-trainer.add_callback(LoggingCallback("./results/log.jsonl"))
+trainer.add_callback(LoggingCallback("./results/log_classic.jsonl"))
 #%%
 best_run = trainer.hyperparameter_search(
     direction="maximize", 
